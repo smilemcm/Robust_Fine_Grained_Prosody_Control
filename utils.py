@@ -28,9 +28,6 @@ def load_wav_to_torch(full_path):
     sampling_rate, data = read(full_path)
     return torch.FloatTensor(data.astype(np.float32)), sampling_rate
 
-    data, sampling_rate = librosa.load(full_path, sr=22050)
-    return torch.FloatTensor(data.astype(np.float32)), sampling_rate
-
 
 def load_filepaths_and_text(filename, split="|"):
     with open(filename, encoding='utf-8') as f:
