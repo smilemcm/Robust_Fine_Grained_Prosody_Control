@@ -25,8 +25,8 @@ def create_hparams(hparams_string=None, verbose=False):
         # Data Parameters             #
         ################################
         load_mel_from_disk=False,
-        training_files='filelists/libritts_train_clean_100_audiopath_text_sid_shorterthan10s_atleast5min_train_filelist_22k_skipped.txt',
-        validation_files='filelists/libritts_train_clean_100_audiopath_text_sid_atleast5min_val_filelist_22k_skipped.txt',
+        training_files='filelists/libritts_train_clean_100_audiopath_text_sid_shorterthan10s_atleast5min_train_filelist_skipped.txt',
+        validation_files='filelists/libritts_train_clean_100_audiopath_text_sid_atleast5min_val_filelist_skipped.txt',
         text_cleaners=['english_cleaners'],
 
         ################################
@@ -96,7 +96,7 @@ def create_hparams(hparams_string=None, verbose=False):
         learning_rate=1e-3,
         weight_decay=1e-6,
         grad_clip_thresh=1.0,
-        batch_size=64,
+        batch_size=16,
         mask_padding=True  # set model's padded outputs to padded values
     )
 
