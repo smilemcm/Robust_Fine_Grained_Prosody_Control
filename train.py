@@ -3,10 +3,12 @@ import time
 import argparse
 import math
 from numpy import finfo
+from contextlib import contextmanager
 
 import torch
 from distributed import apply_gradient_allreduce
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 
@@ -17,11 +19,26 @@ from logger import Tacotron2Logger
 from hparams import create_hparams
 
 
-def reduce_tensor(tensor, n_gpus):
+from apex import amp
+amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
+amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
+
+
+
+def reduce_tensor(tensor, num_gpus):
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= n_gpus
+    if rt.is_floating_point():
+        rt = rt/num_gpus
+    else:
+        rt = rt//num_gpus
     return rt
+
+# def reduce_tensor(tensor, n_gpus):
+#     rt = tensor.clone()
+#     dist.all_reduce(rt, op=dist.reduce_op.SUM)
+#     rt /= n_gpus
+#     return rt
 
 
 def init_distributed(hparams, n_gpus, rank, group_name):
@@ -147,56 +164,63 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
         logger.log_validation(val_loss, model, y, y_pred, iteration)
 
 
-def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
-          rank, group_name, hparams):
+def train(gpu, args):
+
+    # args.output_directory, args.log_directory, args.checkpoint_path, args.warm_start, args.n_gpus,
+    #       rank, group_name, hparams):
+
     """Training and validation logging results to tensorboard and stdout
 
     Params
     ------
-    output_directory (string): directory to save checkpoints
-    log_directory (string) directory to save tensorboard logs
-    checkpoint_path(string): checkpoint path
-    n_gpus (int): number of gpus
+    args.output_directory (string): directory to save checkpoints
+    args.log_directory (string) directory to save tensorboard logs
+    args.checkpoint_path(string): checkpoint path
+    args.n_gpus (int): number of gpus
     rank (int): rank of current gpu
     hparams (object): comma separated list of "name=value" pairs.
     """
-    if hparams.distributed_run:
-        init_distributed(hparams, n_gpus, rank, group_name)
 
-    torch.manual_seed(hparams.seed)
-    torch.cuda.manual_seed(hparams.seed)
+    rank = args.node_rank * args.n_gpus + gpu
 
-    model = load_model(hparams)
-    learning_rate = hparams.learning_rate
+
+    if args.hparams.distributed_run:
+        init_distributed(args.hparams, args.n_gpus, rank, args.group_name)
+
+    torch.manual_seed(args.hparams.seed)
+    torch.cuda.manual_seed(args.hparams.seed)
+
+    model = load_model(args.hparams)
+    learning_rate = args.hparams.learning_rate
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
-                                 weight_decay=hparams.weight_decay)
+                                 weight_decay=args.hparams.weight_decay)
 
-    if hparams.fp16_run:
+    if args.hparams.fp16_run:
         from apex import amp
         model, optimizer = amp.initialize(
             model, optimizer, opt_level='O2')
 
-    if hparams.distributed_run:
+    if args.hparams.distributed_run:
         model = apply_gradient_allreduce(model)
 
     criterion = Tacotron2Loss()
 
     logger = prepare_directories_and_logger(
-        output_directory, log_directory, rank)
+        args.output_directory, args.log_directory, rank)
 
-    train_loader, valset, collate_fn = prepare_dataloaders(hparams)
+    train_loader, valset, collate_fn = prepare_dataloaders(args.hparams)
 
     # Load checkpoint if one exists
     iteration = 0
     epoch_offset = 0
-    if checkpoint_path is not None:
-        if warm_start:
+    if args.checkpoint_path is not None:
+        if args.warm_start:
             model = warm_start_model(
-                checkpoint_path, model, hparams.ignore_layers)
+                args.checkpoint_path, model, args.hparams.ignore_layers)
         else:
             model, optimizer, _learning_rate, iteration = load_checkpoint(
-                checkpoint_path, model, optimizer)
-            if hparams.use_saved_learning_rate:
+                args.checkpoint_path, model, optimizer)
+            if args.hparams.use_saved_learning_rate:
                 learning_rate = _learning_rate
             iteration += 1  # next iteration is iteration + 1
             epoch_offset = max(0, int(iteration / len(train_loader)))
@@ -204,7 +228,7 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     model.train()
     is_overflow = False
     # ================ MAIN TRAINNIG LOOP! ===================
-    for epoch in range(epoch_offset, hparams.epochs):
+    for epoch in range(epoch_offset, args.hparams.epochs):
         print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
             start = time.perf_counter()
@@ -232,23 +256,23 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
             y_pred = model(x)
 
             loss = criterion(y_pred, y)
-            if hparams.distributed_run:
-                reduced_loss = reduce_tensor(loss.data, n_gpus).item()
+            if args.hparams.distributed_run:
+                reduced_loss = reduce_tensor(loss.data, args.n_gpus).item()
             else:
                 reduced_loss = loss.item()
-            if hparams.fp16_run:
+            if args.hparams.fp16_run:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.backward()
 
-            if hparams.fp16_run:
+            if args.hparams.fp16_run:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    amp.master_params(optimizer), hparams.grad_clip_thresh)
+                    amp.master_params(optimizer), args.hparams.grad_clip_thresh)
                 is_overflow = math.isnan(grad_norm)
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), hparams.grad_clip_thresh)
+                    model.parameters(), args.hparams.grad_clip_thresh)
 
             optimizer.step()
 
@@ -257,23 +281,23 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
                 logger.log_training(
                     reduced_loss, grad_norm, learning_rate, duration, iteration)
 
-            if not is_overflow and (iteration % hparams.iters_per_checkpoint == 0):
+            if not is_overflow and (iteration % args.hparams.iters_per_checkpoint == 0):
                 print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
                     iteration, reduced_loss, grad_norm, duration))
                 validate(model, criterion, valset, iteration,
-                         hparams.batch_size, n_gpus, collate_fn, logger,
-                         hparams.distributed_run, rank)
+                         args.hparams.batch_size, args.n_gpus, collate_fn, logger,
+                         args.hparams.distributed_run, rank)
                 if rank == 0:
-                    checkpoint_path = os.path.join(
-                        output_directory, "checkpoint_{}_{}".format(iteration, output_directory.split('/')[-1].replace('outdir_', '')))
+                    args.checkpoint_path = os.path.join(
+                        args.output_directory, "checkpoint_{}_{}".format(iteration, args.output_directory.split('/')[-1].replace('outdir_', '')))
                     save_checkpoint(model, optimizer, learning_rate, iteration,
-                                    checkpoint_path)
+                                    args.checkpoint_path)
 
             iteration += 1
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='tutletron with mcm')
     parser.add_argument('-o', '--output_directory', type=str,
                         help='directory to save checkpoints')
     parser.add_argument('-l', '--log_directory', type=str,
@@ -284,7 +308,7 @@ if __name__ == '__main__':
                         help='load model weights only, ignore specified layers')
     parser.add_argument('--n_gpus', type=int, default=1,
                         required=False, help='number of gpus')
-    parser.add_argument('--rank', type=int, default=0,
+    parser.add_argument('--node_rank', type=int, default=0,
                         required=False, help='rank of current gpu')
     parser.add_argument('--group_name', type=str, default='group_name',
                         required=False, help='Distributed group name')
@@ -293,6 +317,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     hparams = create_hparams(args.hparams)
+    args.hparams = hparams
 
     torch.backends.cudnn.enabled = hparams.cudnn_enabled
     torch.backends.cudnn.benchmark = hparams.cudnn_benchmark
@@ -303,5 +328,7 @@ if __name__ == '__main__':
     print("cuDNN Enabled:", hparams.cudnn_enabled)
     print("cuDNN Benchmark:", hparams.cudnn_benchmark)
 
-    train(args.output_directory, args.log_directory, args.checkpoint_path,
-          args.warm_start, args.n_gpus, args.rank, args.group_name, hparams)
+    mp.spawn(train, nprocs=args.n_gpus, args=(args,))
+
+    # train(args.output_directory, args.log_directory, args.checkpoint_path,
+    #       args.warm_start, args.n_gpus, args.rank, args.group_name, hparams)
