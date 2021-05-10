@@ -56,7 +56,7 @@ def init_distributed(hparams, n_gpus, rank, group_name):
     print("Done initializing distributed")
 
 
-def prepare_dataloaders(hparams):
+def prepare_dataloaders(hparams, rank, world_size):
     # Get data, data loaders and collate function ready
     trainset = TextMelLoader(hparams.training_files, hparams)
     valset = TextMelLoader(hparams.validation_files, hparams,
@@ -64,7 +64,10 @@ def prepare_dataloaders(hparams):
     collate_fn = TextMelCollate(hparams.n_frames_per_step)
 
     if hparams.distributed_run:
-        train_sampler = DistributedSampler(trainset)
+        train_sampler = DistributedSampler(trainset,
+                                           num_replicas=world_size,
+                                           rank=rank
+                                           )
         shuffle = False
     else:
         train_sampler = None
@@ -74,7 +77,7 @@ def prepare_dataloaders(hparams):
                               sampler=train_sampler,
                               batch_size=hparams.batch_size, pin_memory=False,
                               drop_last=True, collate_fn=collate_fn)
-    return train_loader, valset, collate_fn
+    return train_loader, valset, collate_fn, train_sampler
 
 
 def prepare_directories_and_logger(output_directory, log_directory, rank):
@@ -182,6 +185,7 @@ def train(gpu, args):
     """
 
     rank = args.node_rank * args.n_gpus + gpu
+    print(f"rank : {rank}" )
 
 
     if args.hparams.distributed_run:
@@ -191,6 +195,12 @@ def train(gpu, args):
     torch.cuda.manual_seed(args.hparams.seed)
 
     model = load_model(args.hparams)
+
+    #### mcm...
+    torch.cuda.set_device(gpu)
+    model.cuda(gpu)
+
+
     learning_rate = args.hparams.learning_rate
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate,
                                  weight_decay=args.hparams.weight_decay)
@@ -199,16 +209,18 @@ def train(gpu, args):
         from apex import amp
         model, optimizer = amp.initialize(
             model, optimizer, opt_level='O2')
+        # mcm
+        model = DDP(model)
 
     if args.hparams.distributed_run:
         model = apply_gradient_allreduce(model)
 
-    criterion = Tacotron2Loss()
+    criterion = Tacotron2Loss(args.hparams.fp16_run, gpu)
 
     logger = prepare_directories_and_logger(
         args.output_directory, args.log_directory, rank)
 
-    train_loader, valset, collate_fn = prepare_dataloaders(args.hparams)
+    train_loader, valset, collate_fn, train_sampler = prepare_dataloaders(args.hparams, rank,args.hparams.world_size )
 
     # Load checkpoint if one exists
     iteration = 0
@@ -230,8 +242,16 @@ def train(gpu, args):
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, args.hparams.epochs):
         print("Epoch: {}".format(epoch))
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         for i, batch in enumerate(train_loader):
             start = time.perf_counter()
+
+            if iteration > 0 and iteration % args.hparams.learning_rate_anneal == 0:
+                learning_rate = max(
+                    args.hparams.learning_rate_min, learning_rate * 0.5)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = learning_rate
 
             if iteration < 50000:
                 learning_rate = 1e-3
@@ -248,11 +268,11 @@ def train(gpu, args):
             else:
                 learning_rate = 1e-5
 
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = learning_rate
+            # for param_group in optimizer.param_groups:
+            #     param_group['lr'] = learning_rate
 
             model.zero_grad()
-            x, y = model.parse_batch(batch)
+            x, y = model.parse_batch(batch, args.hparams.distributed_run)
             y_pred = model(x)
 
             loss = criterion(y_pred, y)
@@ -306,7 +326,7 @@ if __name__ == '__main__':
                         required=False, help='checkpoint path')
     parser.add_argument('--warm_start', action='store_true',
                         help='load model weights only, ignore specified layers')
-    parser.add_argument('--n_gpus', type=int, default=1,
+    parser.add_argument('--n_gpus', type=int, default=2,
                         required=False, help='number of gpus')
     parser.add_argument('--node_rank', type=int, default=0,
                         required=False, help='rank of current gpu')
